@@ -272,8 +272,6 @@ def get_people_enrich(
     raw_rows = []
 
     for i,people in enumerate(results.get('people', [])):
-        if i==1:
-            break
         required = {
             "first_name": people.get('first_name'),
             "organization_name": (people.get('organization') or {}).get('name'),
