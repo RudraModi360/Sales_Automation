@@ -8,7 +8,8 @@ def search_people(
     api_key: str,
     batch_interval: int = 2000,
     max_pages: int = 2,
-    timeout: int = 30,
+    timeout: int = 60,
+    retries_per_page: int = 2,
 ) -> dict:
     url = "https://api.apollo.io/api/v1/mixed_people/api_search"
     headers = {
@@ -23,41 +24,58 @@ def search_people(
         "page_count": 0,
     }
 
-    try:
-        for page in range(1, max_pages + 1):
-            payload = filters.copy()
-            payload["page"] = page
+    last_data = {}
 
-            print(f"Fetching page {page}...")
-            response = requests.post(
-                url,
-                params=payload,
-                headers=headers,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
+    for page in range(1, max_pages + 1):
+        payload = filters.copy()
+        payload["page"] = page
 
-            if "people" in data:
-                all_results["people"].extend(data["people"])
+        print(f"Fetching page {page}...")
+        page_data = None
 
-            if "meta" in data:
-                all_results["meta"] = data["meta"]
-                all_results["page_count"] = page
+        for attempt in range(retries_per_page + 1):
+            try:
+                response = requests.post(
+                    url,
+                    params=payload,
+                    headers=headers,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                page_data = response.json()
+                break
+            except requests.exceptions.RequestException as exc:
+                if attempt < retries_per_page:
+                    print(
+                        f"Page {page} request failed (attempt {attempt + 1}/{retries_per_page + 1}): {exc}. Retrying..."
+                    )
+                    time.sleep(2)
+                    continue
 
-                if data["meta"].get("pagination", {}).get("total_pages", 1) == page:
-                    print(f"Reached last page: {page}")
-                    break
+                print(f"Error during API request on page {page}: {exc}")
 
-            if page < max_pages:
-                time.sleep(batch_interval / 1000)
+        if page_data is None:
+            # Keep any results collected from previous pages.
+            break
 
-        all_results["total_records"] = data.get("total_entries", 0)
-        return all_results
+        last_data = page_data
 
-    except requests.exceptions.RequestException as exc:
-        print(f"Error during API request: {exc}")
-        return {"error": str(exc), "people": [], "meta": {}, "total_records": 0}
+        if "people" in page_data:
+            all_results["people"].extend(page_data["people"])
+
+        if "meta" in page_data:
+            all_results["meta"] = page_data["meta"]
+            all_results["page_count"] = page
+
+            if page_data["meta"].get("pagination", {}).get("total_pages", 1) == page:
+                print(f"Reached last page: {page}")
+                break
+
+        if page < max_pages:
+            time.sleep(batch_interval / 1000)
+
+    all_results["total_records"] = last_data.get("total_entries", len(all_results["people"]))
+    return all_results
 
 
 def collect_enriched_rows(
@@ -98,6 +116,8 @@ def collect_enriched_rows(
                 timeout=timeout,
             )
             response.raise_for_status()
+            print("Response : ",response)
+            print("**"*50)
             data = response.json()
 
             flat = pd.json_normalize(data, sep=".")
