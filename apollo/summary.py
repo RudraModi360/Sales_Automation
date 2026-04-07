@@ -3,6 +3,43 @@ import ast
 import pandas as pd
 
 
+MASTER_SUMMARY_FIELDS = [
+    "full_name",
+    "first_name",
+    "last_name",
+    "email",
+    "job_title",
+    "headline",
+    "seniority",
+    "function",
+    "subdepartment",
+    "person_linkedin",
+    "person_twitter",
+    "person_location",
+    "timezone",
+    "company_name",
+    "company_description",
+    "company_website",
+    "company_domain",
+    "company_linkedin",
+    "company_twitter",
+    "company_facebook",
+    "company_phone",
+    "company_industry",
+    "company_industries",
+    "company_secondary_industries",
+    "company_estimated_employees",
+    "company_revenue",
+    "company_founded_year",
+    "company_languages",
+    "company_address",
+    "company_city",
+    "company_state",
+    "company_country",
+    "source",
+]
+
+
 def normalize_value(value):
     if value is None:
         return None
@@ -144,9 +181,7 @@ def transform_overview_to_summary(df):
         records.append(record)
 
     out_df = pd.DataFrame(records)
-
-    keep_mask = out_df.notna().sum() > 0
-    out_df = out_df.loc[:, keep_mask]
+    out_df = out_df.reindex(columns=MASTER_SUMMARY_FIELDS)
 
     dedupe_keys = [key for key in ["email", "full_name", "company_name"] if key in out_df.columns]
     if dedupe_keys:
@@ -155,4 +190,4 @@ def transform_overview_to_summary(df):
     if "email" in out_df.columns:
         out_df = out_df.sort_values(by=["email"], na_position="last")
 
-    return out_df.reset_index(drop=True)
+    return out_df.fillna("").reset_index(drop=True)

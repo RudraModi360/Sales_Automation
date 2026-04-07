@@ -38,6 +38,31 @@ def list_campaigns(api_key: None = None, base_url: None = None, timeout: int = 6
         print(f"Error fetching campaigns: {response.status_code} - {response.text}")
         return {"error": f"{response.status_code} - {response.text}", "campaigns": []}
 
+def extract_country_names(campaign_response: dict) -> list[str]:
+    """
+    Extract campaign names (country names) from Instantly campaigns response.
+
+    Args:
+        campaign_response (dict): API response containing an `items` list
+
+    Returns:
+        list[str]: Country names from each campaign item
+    """
+    items = campaign_response.get("items", [])
+    if not isinstance(items, list):
+        return []
+
+    country_names: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        country_name = item.get("name")
+        if isinstance(country_name, str) and country_name.strip():
+            country_names.append(country_name.strip())
+
+    return country_names
+
 def start_campaign(campaign_id: str, api_key: str = None, base_url: str = None, timeout: int = 60) -> dict:
     """
     Start (activate) a campaign in Instantly.ai using the campaigns API endpoint.

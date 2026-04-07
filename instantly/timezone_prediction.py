@@ -215,3 +215,6 @@ Etc/GMT+12, Etc/GMT+11, Etc/GMT+10, America/Anchorage, America/Dawson, America/C
         "success": False,
         "error_message": "Failed to predict valid timezone after maximum retries"
     }
+
+
+print(predict_timezone("Austria")['timezone'])
