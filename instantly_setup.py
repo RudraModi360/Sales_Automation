@@ -40,7 +40,7 @@ def main(max_retries: int = 3):
             except Exception as e:
                 print(f"Error predicting timezone for {country}: {str(e)}")
                 timezone="Unknown"
-    print("Final predicted timezones:", timezones)
+    print("Final predicted timezones:", timezones)  
     
 if __name__ == "__main__":
     main()
