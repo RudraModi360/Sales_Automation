@@ -299,14 +299,7 @@ def email_chain_generation(client, df, person_context):
             "type": email_type,
             "description": description,
             "structured_output": output["structured"],
-            "full_text": output["full_text"],
-            "token_usage": {
-                "input_tokens": output["usage"]["input_tokens"],
-                "cache_creation_input_tokens": output["usage"]["cache_creation_input_tokens"],
-                "cache_read_input_tokens": output["usage"]["cache_read_input_tokens"],
-                "output_tokens": output["usage"]["output_tokens"],
-            },
-            "cache_efficiency": cache_efficiency,
+            "full_text": output["full_text"]
         })
 
         previous_email_text = output["full_text"]
