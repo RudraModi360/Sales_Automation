@@ -69,7 +69,7 @@ def _load_email_generation_bindings() -> dict[str, Any]:
         )
 
     return {
-        "default_anthropic_client": getattr(module, "client"),
+        "default_ollama_client": getattr(module, "client"),
         "groq_client": getattr(module, "client_groq"),
         "person_data_explorer": getattr(module, "person_data_explorer"),
         "email_chain_generation": getattr(module, "email_chain_generation"),
@@ -77,20 +77,32 @@ def _load_email_generation_bindings() -> dict[str, Any]:
     }
 
 
-def _build_anthropic_client(default_client: Any):
+def _build_ollama_client(default_client: Any):
     if default_client is not None:
         return default_client
 
     try:
-        anthropic_module = importlib.import_module("anthropic")
+        ollama_module = importlib.import_module("ollama")
     except ModuleNotFoundError as exc:
-        raise RuntimeError("anthropic package is not installed. Install it before running outreach integration.") from exc
+        raise RuntimeError("ollama package is not installed. Install it before running outreach integration.") from exc
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is required for email chain generation.")
+    client_class = getattr(ollama_module, "Client", None)
+    if client_class is None:
+        raise RuntimeError("Unable to initialize Ollama client from ollama package.")
 
-    return anthropic_module.Anthropic(api_key=api_key)
+    host = (os.getenv("OLLAMA_HOST") or "").strip()
+    api_key = (os.getenv("OLLAMA_API_KEY") or "").strip()
+
+    if api_key:
+        return client_class(
+            host=host or "https://ollama.com",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+
+    if host:
+        return client_class(host=host)
+
+    return client_class()
 
 
 def _normalize_value(value: Any) -> Any:
@@ -143,7 +155,7 @@ def run_non_matching_outreach(
     max_records_per_country: int | None = None,
 ) -> dict[str, Any]:
     bindings = _load_email_generation_bindings()
-    anthropic_client = _build_anthropic_client(bindings["default_anthropic_client"])
+    ollama_client = _build_ollama_client(bindings["default_ollama_client"])
     groq_client = bindings["groq_client"]
 
     if groq_client is None:
@@ -203,7 +215,7 @@ def run_non_matching_outreach(
             try:
                 person_context = bindings["person_data_explorer"](groq_client, normalized_row)
                 chain_results = bindings["email_chain_generation"](
-                    client=anthropic_client,
+                    client=ollama_client,
                     df=normalized_row,
                     person_context=person_context,
                 )

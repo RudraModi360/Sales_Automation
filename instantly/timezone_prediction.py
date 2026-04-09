@@ -1,9 +1,10 @@
 import os
 import re
-from typing import Optional
+import importlib
+from typing import Optional, Literal, Any
 
-import anthropic
 from dotenv import load_dotenv
+from pydantic import BaseModel, ValidationError
 
 load_dotenv()
 
@@ -83,6 +84,79 @@ CONTEXT_TIMEZONE_FALLBACKS = {
 
 ETC_GMT_OFFSET_PATTERN = re.compile(r"^Etc/GMT([+-])(\d{1,2}(?:\.\d+)?)$", re.IGNORECASE)
 UTC_GMT_OFFSET_PATTERN = re.compile(r"^(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
+
+class TimezonePredictionOutput(BaseModel):
+    timezone: str
+    confidence: Literal["high", "medium", "low"] = "medium"
+    reasoning: str
+
+
+def _build_ollama_client():
+    try:
+        ollama_module = importlib.import_module("ollama")
+    except ModuleNotFoundError:
+        return None
+
+    client_class = getattr(ollama_module, "Client", None)
+    if client_class is None:
+        return None
+
+    host = (os.getenv("OLLAMA_HOST") or "").strip()
+    api_key = (os.getenv("OLLAMA_API_KEY") or "").strip()
+
+    if api_key:
+        return client_class(
+            host=host or "https://ollama.com",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+
+    if host:
+        return client_class(host=host)
+
+    return client_class()
+
+
+def _extract_ollama_message_content(response: Any) -> str:
+    if isinstance(response, dict):
+        message = response.get("message") or {}
+        return str(message.get("content") or "")
+
+    message = getattr(response, "message", None)
+    if isinstance(message, dict):
+        return str(message.get("content") or "")
+
+    return str(getattr(message, "content", "") or "")
+
+
+def _parse_timezone_prediction_json(raw_content: str) -> TimezonePredictionOutput:
+    if not raw_content or not str(raw_content).strip():
+        raise RuntimeError("Model did not return content for timezone prediction.")
+
+    text = str(raw_content).strip()
+
+    try:
+        return TimezonePredictionOutput.model_validate_json(text)
+    except ValidationError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise RuntimeError("Timezone prediction response was not valid JSON.")
+        return TimezonePredictionOutput.model_validate_json(text[start : end + 1])
+
+
+def _ollama_chat_with_schema(ollama_client: Any, model_name: str, prompt: str) -> Any:
+    kwargs = {
+        "messages": [{"role": "user", "content": prompt}],
+        "format": TimezonePredictionOutput.model_json_schema(),
+        "options": {"temperature": 0, "num_predict": 256},
+        "stream": False,
+    }
+
+    try:
+        return ollama_client.chat(model=model_name, **kwargs)
+    except TypeError:
+        return ollama_client.chat(model_name, **kwargs)
 
 
 def _fallback_timezone_from_context(context: str) -> Optional[str]:
@@ -170,15 +244,13 @@ def is_valid_timezone(timezone: str) -> bool:
 def predict_timezone(
     context: str,
     max_retries: int = 3,
-    previous_predictions: Optional[list] = None
 ) -> dict:
     """
-    Predict timezone using Claude with strict validation against Instantly-supported values.
+    Predict timezone using Ollama with strict validation against Instantly-supported values.
     
     Args:
         context: Description/context about the timezone (e.g., "User is in Mumbai, India")
         max_retries: Maximum retry attempts (default 3)
-        previous_predictions: List of previous failed predictions for context (for fallback)
         
     Returns:
         dict: {
@@ -194,18 +266,26 @@ def predict_timezone(
     
     context = str(context or "").strip() or "unknown"
     max_retries = max(1, int(max_retries))
-    attempted_predictions = [
-        str(pred).strip() for pred in (previous_predictions or []) if str(pred).strip()
-    ]
+    retry_feedback: list[str] = []
 
-    do_not_repeat_note = ""
-    if attempted_predictions:
-        do_not_repeat_note = (
-            "\n\nRejected attempts (do not repeat): "
-            + ", ".join(attempted_predictions)
+    client = _build_ollama_client()
+    if client is None:
+        raise RuntimeError(
+            "Ollama client is not configured. Install ollama and set OLLAMA_HOST/OLLAMA_API_KEY as needed."
         )
 
-    system_prompt = f"""You are a timezone prediction expert.
+    model_name = os.getenv("OLLAMA_LIGHT_MODEL") or os.getenv("OLLAMA_MODEL") or "gpt-oss:20b-cloud"
+    last_error_message = ""
+
+    for attempt in range(1, max_retries + 1):
+        retry_feedback_note = ""
+        if retry_feedback:
+            retry_feedback_note = (
+                "\n\nPREVIOUS FAILED ATTEMPTS (avoid repeating):\n"
+                + "\n".join(f"- {item}" for item in retry_feedback)
+            )
+
+        prompt = f"""You are a timezone prediction expert.
 
 CRITICAL RULES:
 1. Return EXACTLY one timezone from the allowed list below.
@@ -214,69 +294,36 @@ CRITICAL RULES:
 4. Prefer major city timezone for the given context.
 
 ALLOWED TIMEZONE LIST:
-{VALID_TIMEZONE_LIST_PROMPT}{do_not_repeat_note}"""
+{VALID_TIMEZONE_LIST_PROMPT}
 
-    client = anthropic.Anthropic()
-    model_name = os.getenv("ANTHROPIC_LIGHT_MODEL") or "claude-3-5-haiku-latest"
-    last_error_message = ""
+Context:
+{context}
+{retry_feedback_note}
 
-    for attempt in range(1, max_retries + 1):
+Return ONLY valid JSON with exactly these keys:
+- timezone
+- confidence (high, medium, or low)
+- reasoning
+"""
+
         try:
-            response = client.messages.create(
-                model=model_name,
-                max_tokens=500,
-                system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Predict the timezone for: {context}",
-                    }
-                ],
-                tools=[
-                    {
-                        "name": "timezone_prediction",
-                        "description": "Predict a timezone from the allowed list",
-                        "input_schema": {
-                            "type": "object",
-                            "properties": {
-                                "timezone": {
-                                    "type": "string",
-                                    "description": "Timezone value selected from the allowed list",
-                                },
-                                "confidence": {
-                                    "type": "string",
-                                    "enum": ["high", "medium", "low"],
-                                    "description": "Confidence level of prediction",
-                                },
-                                "reasoning": {
-                                    "type": "string",
-                                    "description": "Short reasoning for timezone choice",
-                                },
-                            },
-                            "required": ["timezone", "confidence", "reasoning"],
-                        },
-                    }
-                ],
+            response = _ollama_chat_with_schema(client, model_name, prompt)
+            raw_content = _extract_ollama_message_content(response)
+            parsed = _parse_timezone_prediction_json(raw_content)
+        except Exception as exc:  # pragma: no cover - runtime/API-dependent branch
+            error_summary = str(exc).strip().replace("\n", " ")
+            if len(error_summary) > 200:
+                error_summary = f"{error_summary[:197]}..."
+
+            last_error_message = error_summary
+            retry_feedback.append(
+                f"Attempt {attempt}: response was not valid JSON ({error_summary})"
             )
-        except anthropic.APIError as exc:
-            last_error_message = str(exc)
             if attempt < max_retries:
                 continue
             break
 
-        tool_result = None
-        for content_block in response.content:
-            if content_block.type == "tool_use":
-                tool_result = content_block.input
-                break
-
-        if not tool_result:
-            last_error_message = "No tool use output received"
-            if attempt < max_retries:
-                continue
-            break
-
-        raw_timezone = str(tool_result.get("timezone", "") or "").strip()
+        raw_timezone = str(parsed.timezone or "").strip()
         normalized_timezone = normalize_timezone(
             raw_timezone,
             context=context,
@@ -284,7 +331,7 @@ ALLOWED TIMEZONE LIST:
         )
 
         if normalized_timezone and is_valid_timezone(normalized_timezone):
-            reasoning = str(tool_result.get("reasoning", "") or "").strip()
+            reasoning = str(parsed.reasoning or "").strip()
             if normalized_timezone != raw_timezone:
                 reasoning = (
                     f"{reasoning} Normalized '{raw_timezone}' to '{normalized_timezone}'."
@@ -292,7 +339,7 @@ ALLOWED TIMEZONE LIST:
 
             return {
                 "timezone": normalized_timezone,
-                "confidence": tool_result.get("confidence", "medium"),
+                "confidence": parsed.confidence,
                 "reasoning": reasoning,
                 "is_valid": True,
                 "attempt": attempt,
@@ -300,14 +347,12 @@ ALLOWED TIMEZONE LIST:
                 "error_message": None,
             }
 
-        attempted_predictions.append(raw_timezone or "<empty>")
+        retry_feedback.append(
+            f"Attempt {attempt}: predicted '{raw_timezone or '<empty>'}', which is invalid for Instantly"
+        )
         last_error_message = f"Timezone '{raw_timezone}' is invalid for Instantly"
 
-    fallback_timezone = normalize_timezone(
-        "",
-        context=context,
-        allow_context_fallback=True,
-    ) or "Africa/Abidjan"
+    fallback_timezone = _fallback_timezone_from_context(context) or "Africa/Abidjan"
 
     return {
         "timezone": fallback_timezone,

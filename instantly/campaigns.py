@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import textwrap
 from dotenv import load_dotenv
@@ -11,6 +12,87 @@ except ImportError:
     from timezone_prediction import is_valid_timezone, predict_timezone
 
 load_dotenv()
+
+
+_BR_TAG_PATTERN = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+_TEMPLATE_VARIABLE_PATTERN = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
+_LINE_BLOCK_STYLE = "margin:0;padding:0;line-height:1.2;"
+
+
+def _normalize_template_body(raw_body: str) -> str:
+    """
+    Normalize email body for Instantly and preserve visual line breaks without <br>.
+
+    Why: Instantly may drop/ignore <br> tags in campaign create payloads.
+    We convert the template into explicit HTML block lines (<div>) so the
+    sequence editor and sent emails keep the intended structure.
+    """
+    body = textwrap.dedent(str(raw_body or "")).strip()
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    
+    if _BR_TAG_PATTERN.search(body):
+        body = re.sub(r"\n\s*", "", body)
+
+    body = _BR_TAG_PATTERN.sub("\n", body)
+
+    lines = [line.strip() for line in body.split("\n")]
+
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+
+    if not lines:
+        return ""
+
+    normalized_lines: list[str] = []
+    previous_blank = False
+    for line in lines:
+        is_blank = not line
+        if is_blank:
+            if previous_blank:
+                continue
+            normalized_lines.append(f"<div style=\"{_LINE_BLOCK_STYLE}\">&nbsp;</div>")
+        else:
+            normalized_lines.append(f"<div style=\"{_LINE_BLOCK_STYLE}\">{line}</div>")
+
+        previous_blank = is_blank
+
+    return "".join(normalized_lines)
+
+
+def _get_campaign_step_bodies(campaign_data: dict) -> list[str]:
+    sequences = campaign_data.get("sequences")
+    if not isinstance(sequences, list) or not sequences:
+        return []
+
+    first_sequence = sequences[0]
+    if not isinstance(first_sequence, dict):
+        return []
+
+    steps = first_sequence.get("steps")
+    if not isinstance(steps, list):
+        return []
+
+    bodies: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            bodies.append("")
+            continue
+
+        variants = step.get("variants")
+        if not isinstance(variants, list) or not variants:
+            bodies.append("")
+            continue
+
+        first_variant = variants[0]
+        if not isinstance(first_variant, dict):
+            bodies.append("")
+            continue
+
+        bodies.append(str(first_variant.get("body", "") or ""))
+
+    return bodies
 
 
 def _is_timezone_validation_error(status_code: int, response_text: str) -> bool:
@@ -196,6 +278,7 @@ def create_campaign(
     timeout: int = 60,
     timezone: str = None,
     max_timezone_attempts: int = 3,
+    debug: bool = False,
 ) -> dict:
     """
     Create a new campaign in Instantly.ai using email templates.
@@ -225,7 +308,7 @@ def create_campaign(
             raise ValueError("Base URL is required. Set INSTANTLY_BASE_URL in .env or pass as argument")
 
     max_timezone_attempts = max(1, int(max_timezone_attempts))
-    failed_timezone_predictions: list[str] = []
+    timezone_prediction_context = country_name
 
     if timezone is not None:
         timezone = str(timezone).strip()
@@ -234,7 +317,9 @@ def create_campaign(
                 f"Provided timezone '{timezone}' is invalid. "
                 "Falling back to auto-prediction."
             )
-            failed_timezone_predictions.append(timezone)
+            timezone_prediction_context = (
+                f"{country_name}\nPreviously rejected timezone: {timezone}"
+            )
             timezone = None
 
     templates = email_format()
@@ -242,12 +327,16 @@ def create_campaign(
         raise ValueError("At least 5 email templates are required")
 
     steps = []
-    for i in range(len(templates)):
-        subject = get_subject_line()
-        body = templates[i]
-        # Use textwrap.dedent to preserve spacing while removing leading indentation
-        body = textwrap.dedent(body).strip()
-        delay = 1
+    for i, template in enumerate(templates):
+        subject = str(get_subject_line() or "").strip()
+        body = _normalize_template_body(template)
+
+        if not subject:
+            raise ValueError(f"Subject is empty for template index {i}")
+        if not body:
+            raise ValueError(f"Body is empty for template index {i}")
+
+        delay = 0 if i == 0 else 1
         
         steps.append(
             {
@@ -263,10 +352,30 @@ def create_campaign(
             }
         )
 
+    if debug:
+        variables_found = sorted(
+            {
+                variable
+                for step in steps
+                for variable in _TEMPLATE_VARIABLE_PATTERN.findall(
+                    step["variants"][0]["body"]
+                )
+            }
+        )
+        print(
+            "Prepared campaign step bodies "
+            f"(count={len(steps)}, first_body_len={len(steps[0]['variants'][0]['body'])})"
+        )
+        print(f"Template variables found in bodies: {variables_found}")
+
     campaign_name = country_name.strip()
 
-    url = base_url + "/api/v2/campaigns"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    url = base_url.rstrip("/") + "/api/v2/campaigns"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
     last_response = None
     campaign_payload = None
@@ -274,9 +383,8 @@ def create_campaign(
     for timezone_attempt in range(1, max_timezone_attempts + 1):
         if timezone is None:
             prediction = predict_timezone(
-                context=country_name,
+                context=timezone_prediction_context,
                 max_retries=3,
-                previous_predictions=failed_timezone_predictions,
             )
             predicted_timezone = str(prediction.get("timezone", "") or "").strip()
             is_valid_prediction = bool(prediction.get("is_valid")) and is_valid_timezone(
@@ -290,7 +398,9 @@ def create_campaign(
 
             if not is_valid_prediction:
                 if predicted_timezone:
-                    failed_timezone_predictions.append(predicted_timezone)
+                    timezone_prediction_context = (
+                        f"{country_name}\nPreviously rejected timezone: {predicted_timezone}"
+                    )
 
                 if timezone_attempt < max_timezone_attempts:
                     continue
@@ -342,7 +452,35 @@ def create_campaign(
         last_response = response
 
         if response.status_code in (200, 201):
-            return response.json()
+            response_data = response.json()
+
+            if debug:
+                request_bodies = [step["variants"][0]["body"] for step in steps]
+                response_bodies = _get_campaign_step_bodies(response_data)
+                print(
+                    "Campaign create debug: "
+                    f"request_body_count={len(request_bodies)}, "
+                    f"response_body_count={len(response_bodies)}"
+                )
+
+                if not response_bodies or any(not body.strip() for body in response_bodies):
+                    campaign_id = response_data.get("id")
+                    if campaign_id:
+                        campaign_details = get_campaign(
+                            campaign_id=campaign_id,
+                            api_key=api_key,
+                            base_url=base_url,
+                            timeout=timeout,
+                        )
+                        server_bodies = _get_campaign_step_bodies(campaign_details)
+                        print(
+                            "Campaign details debug: "
+                            f"campaign_id={campaign_id}, "
+                            f"server_body_count={len(server_bodies)}, "
+                            f"empty_server_bodies={sum(1 for body in server_bodies if not body.strip())}"
+                        )
+
+            return response_data
 
         if _is_timezone_validation_error(response.status_code, response.text):
             print(
@@ -351,7 +489,9 @@ def create_campaign(
             )
 
             if timezone:
-                failed_timezone_predictions.append(timezone)
+                timezone_prediction_context = (
+                    f"{country_name}\nPreviously rejected timezone: {timezone}"
+                )
             timezone = None
 
             if timezone_attempt < max_timezone_attempts:
@@ -373,4 +513,3 @@ def create_campaign(
             else f"{last_response.status_code} - {last_response.text}"
         ),
     }
-    
