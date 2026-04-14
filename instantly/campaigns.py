@@ -20,7 +20,6 @@ def _is_timezone_validation_error(status_code: int, response_text: str) -> bool:
     lowered = (response_text or "").lower()
     return "timezone" in lowered and "allowed values" in lowered
 
-
 def list_campaigns(api_key: None = None, base_url: None = None, timeout: int = 60) -> dict:
     """
     List campaigns in Apollo.io using campaigns API endpoint.
@@ -373,4 +372,3 @@ def create_campaign(
             else f"{last_response.status_code} - {last_response.text}"
         ),
     }
-    

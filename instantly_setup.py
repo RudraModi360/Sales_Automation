@@ -10,7 +10,8 @@ from instantly.helper import restructure_response
 import pandas as pd
 from groq import Groq
 
-client = _build_anthropic_client()
+provider_name = "ollama"
+client = _build_anthropic_client() if provider_name == "anthropic" else None
 
 client_groq = Groq(
     api_key=os.environ.get("GROQ_API_KEY"),
@@ -33,6 +34,8 @@ def main(max_retries: int = 3):
     final_series = pd.Series(dtype=object)
     total_uploaded_records = 0
     total_upload_seconds = 0.0
+
+    print(f"Using LLM provider: {provider_name}")
     
     for country in non_matching_country_groups:
         for key , val in country.items():
@@ -51,7 +54,12 @@ def main(max_retries: int = 3):
                 if i==5:
                     break
                 record=pd.Series(record)
-                result=email_chain_generation(client=client,df=record,person_context=person_data_explorer(client_groq, record))
+                result=email_chain_generation(
+                    client=client,
+                    df=record,
+                    person_context=person_data_explorer(client_groq, record),
+                    provider_name=provider_name,
+                )
                 result=restructure_response(result)
                 final_series = pd.concat([record, result])
                 print(final_series)
